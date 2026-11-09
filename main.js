@@ -1,14 +1,47 @@
-﻿import * as THREE from 'three';
+import * as THREE from 'three';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { ScreenMotionController } from './orbi-screen-motion.js';
+import { EyeExpressionController } from './orbi-eye-expression.js';
 
 // ==========================================
 // ⚙️ CONFIGURATION
 const SNAPPINESS = 15; 
-const RETURN_SPEED = 3; 
+const RETURN_SPEED = 3;
+
+// ORBI FACE SIZE - 1.06 means 6% larger facial features. Adjust as needed.
+const ORBI_FACE_SCALE = 1.2;
+
+// Smooth blink timings copied from the tested Blink Lab.
+const BLINK_CLOSE_MS = 115;
+const BLINK_CLOSED_HOLD_MS = 45;
+const BLINK_OPEN_MS = 190;
+
+// Independent blink motion curves. Supported: linear, smoothstep, smootherstep,
+// ease-in-cubic, ease-out-cubic, ease-in-out-cubic.
+const BLINK_CLOSE_EASING = 'smootherstep';
+const BLINK_OPEN_EASING = 'smootherstep';
+const BLINK_UPPER_FINISH_AT = 0.86;
+
+// Eyebrow movement tuning.
+const BLINK_BROW_BASE_Y = 1.25;
+const BLINK_BROW_DROP_DISTANCE = 2.09;
+const BLINK_BROW_FOLLOW = 1.0;
+const BLINK_BROW_ROTATION_RELAX = 1.0;
+
+// Independent left/right expression response.
+const EYE_EXPRESSION_SMOOTHNESS = 10;
+
+// The subtle existing gaze-driven gradient parallax; character movement does not use this offset.
+const GRADIENT_GAZE_PARALLAX_STRENGTH = 0.02;
+
+// Screen movement is prepared but deliberately disabled until you choose to test it.
+const SCREEN_MOTION_ENABLED = false;
+const SCREEN_MOTION_SPEED = 2.8;
+const SCREEN_MOTION_MARGIN = 0.35;
 // ==========================================
 
 // --- 1. Setup Scene & Orthographic Camera ---
@@ -30,8 +63,13 @@ renderer.toneMapping = THREE.NoToneMapping;
 document.body.appendChild(renderer.domElement);
 
 // --- 2. Build the Face Rig ---
+// This outer root moves the complete Orbi composition on the PC screen.
+// Both the gradient plane and facial features remain descendants of this root.
+const screenMotionRoot = new THREE.Group();
+scene.add(screenMotionRoot);
+
 const orbiGroup = new THREE.Group();
-scene.add(orbiGroup);
+screenMotionRoot.add(orbiGroup);
 
 // --- 3. Generate the Smooth Gradient Face Texture ---
 function createGlowTexture() {
@@ -60,7 +98,12 @@ const faceBase = new THREE.Mesh(faceGeometry, faceMaterial);
 faceBase.position.z = 0;
 orbiGroup.add(faceBase);
 
-// --- 4. Helper: Create Pill Shape (Fully Rounded) ---
+// Facial features scale independently; the background plane and camera do not.
+const facialFeaturesGroup = new THREE.Group();
+facialFeaturesGroup.scale.setScalar(ORBI_FACE_SCALE);
+orbiGroup.add(facialFeaturesGroup);
+
+// --- 4. Helper: Create Pill Shape & Smile ---
 function createPillShape(width, height) {
     const shape = new THREE.Shape();
     const radius = height / 2; 
@@ -76,11 +119,208 @@ function createPillShape(width, height) {
     return new THREE.ShapeGeometry(shape);
 }
 
+// --- Natural eyebrow: thick in the middle, tapered rounded ends, slight upward arch ---
+const BROW_LENGTH = 3.3;
+const BROW_OUTER_END = 1.47; // outer tip stays fixed; changing BROW_LENGTH only moves the inner end
+const BROW_MID_THICKNESS = 0.62;
+const BROW_END_THICKNESS = 0.34;
+const BROW_ARCH = 0.1;
+const BROW_THICKNESS = 0.5; // plain rounded-rectangle brow thickness (was 0.35)
+
+function createBrowGeometry() {
+    const half = BROW_LENGTH / 2;
+    const steps = 28;
+    const capSteps = 12;
+    const top = [];
+    const bottom = [];
+    for (let i = 0; i <= steps; i += 1) {
+        const u = (i / steps) * 2 - 1;
+        const w = 1 - u * u;
+        const thickness = BROW_END_THICKNESS + (BROW_MID_THICKNESS - BROW_END_THICKNESS) * w;
+        const centerY = BROW_ARCH * (w - 0.5);
+        top.push(new THREE.Vector2(u * half, centerY + thickness / 2));
+        bottom.push(new THREE.Vector2(u * half, centerY - thickness / 2));
+    }
+    const endRadius = BROW_END_THICKNESS / 2;
+    const endY = BROW_ARCH * -0.5;
+    const shape = new THREE.Shape();
+    shape.moveTo(top[0].x, top[0].y);
+    for (let i = 1; i <= steps; i += 1) shape.lineTo(top[i].x, top[i].y);
+    for (let k = 1; k < capSteps; k += 1) {
+        const a = Math.PI / 2 - (k / capSteps) * Math.PI;
+        shape.lineTo(half + Math.cos(a) * endRadius, endY + Math.sin(a) * endRadius);
+    }
+    for (let i = steps; i >= 0; i -= 1) shape.lineTo(bottom[i].x, bottom[i].y);
+    for (let k = 1; k < capSteps; k += 1) {
+        const a = -Math.PI / 2 - (k / capSteps) * Math.PI;
+        shape.lineTo(-half + Math.cos(a) * endRadius, endY + Math.sin(a) * endRadius);
+    }
+    return new THREE.ShapeGeometry(shape);
+}
+function createSmile(width, depth, thickness, material) {
+    const group = new THREE.Group();
+    const curve = new THREE.QuadraticBezierCurve3(
+        new THREE.Vector3(-width / 2, 0, 0),
+        new THREE.Vector3(0, depth, 0),
+        new THREE.Vector3(width / 2, 0, 0)
+    );
+    const geo = new THREE.TubeGeometry(curve, 32, thickness / 2, 8, false);
+    const mesh = new THREE.Mesh(geo, material);
+    mesh.renderOrder = 1;
+    
+    const capGeo = new THREE.SphereGeometry(thickness / 2, 16, 16);
+    const cap1 = new THREE.Mesh(capGeo, material);
+    cap1.position.set(-width / 2, 0, 0);
+    cap1.renderOrder = 1;
+    const cap2 = new THREE.Mesh(capGeo, material);
+    cap2.position.set(width / 2, 0, 0);
+    cap2.renderOrder = 1;
+    
+    group.add(mesh, cap1, cap2);
+    return group;
+}
+
+// --- Upper eyelid mask: uses the original face gradient texture, not a new colour. ---
+const upperLidMaterial = new THREE.MeshBasicMaterial({
+    map: faceMaterial.map,
+    side: THREE.DoubleSide,
+    depthTest: false,
+    depthWrite: false
+});
+
+function smootherstep01(value) {
+    const t = THREE.MathUtils.clamp(value, 0, 1);
+    return t * t * t * (t * (t * 6 - 15) + 10);
+}
+
+function applyBlinkEasing(value, curveName) {
+    const t = THREE.MathUtils.clamp(value, 0, 1);
+    switch (curveName) {
+        case 'linear':
+            return t;
+        case 'smoothstep':
+            return t * t * (3 - 2 * t);
+        case 'smootherstep':
+            return smootherstep01(t);
+        case 'ease-in-cubic':
+            return t * t * t;
+        case 'ease-out-cubic':
+            return 1 - Math.pow(1 - t, 3);
+        case 'ease-in-out-cubic':
+            return t < 0.5
+                ? 4 * t * t * t
+                : 1 - Math.pow(-2 * t + 2, 3) / 2;
+        default:
+            throw new Error(`Unsupported blink easing curve: ${curveName}`);
+    }
+}
+
+function createUpperLidMask(eyeX, eyeY) {
+    const radius = 1.3;
+    const segments = 120;
+    const positions = new Float32Array((segments + 1) * 2 * 3);
+    const uvs = new Float32Array((segments + 1) * 2 * 2);
+    const indices = [];
+
+    for (let i = 0; i < segments; i += 1) {
+        const a = i * 2;
+        const b = a + 1;
+        const c = a + 2;
+        const d = a + 3;
+        indices.push(a, b, c, b, d, c);
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    geometry.setIndex(indices);
+
+    const mesh = new THREE.Mesh(geometry, upperLidMaterial);
+    mesh.position.z = 0.07;
+    mesh.renderOrder = 3;
+    mesh.frustumCulled = false;
+
+    // Thick lid-edge line. Hidden unless an expression sets lidLine.
+    const lidLineMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), navyMat);
+    lidLineMesh.renderOrder = 3.5;
+    lidLineMesh.frustumCulled = false;
+    lidLineMesh.visible = false;
+    mesh.add(lidLineMesh);
+    let lidLineThickness = 0;
+
+    function update(progress, direction = 'closing', expressionClosure = 0, tilt = 0) {
+        // Match the tested upper-lid easing. At full closure the upper mask
+        // covers the complete circular eye; no lower lid moves or is animated.
+        const upperPhase = THREE.MathUtils.clamp(progress / BLINK_UPPER_FINISH_AT, 0, 1);
+        // Closing and opening have independent curves. Defaults reproduce the current smooth motion.
+        const blinkCoverage = direction === 'opening'
+            ? 1 - applyBlinkEasing(1 - upperPhase, BLINK_OPEN_EASING)
+            : applyBlinkEasing(upperPhase, BLINK_CLOSE_EASING);
+
+        // Combine the shared blink with this eye's independent expression.
+        // The lower eye boundary remains completely stationary.
+        const upperProgress = Math.max(
+            blinkCoverage,
+            THREE.MathUtils.clamp(expressionClosure, 0, 1)
+        );
+
+        const seamY = THREE.MathUtils.lerp(1.39, -radius, upperProgress);
+        const positionAttribute = geometry.getAttribute('position');
+        const uvAttribute = geometry.getAttribute('uv');
+
+        for (let i = 0; i <= segments; i += 1) {
+            const x = -radius + (2 * radius * i) / segments;
+            const halfHeight = Math.sqrt(Math.max(0, radius * radius - x * x));
+            const bottom = -halfHeight;
+            const top = halfHeight;
+            const curvedBoundary = seamY + 0.06 * Math.pow(x / radius, 2) + tilt * THREE.MathUtils.clamp(upperProgress * 5, 0, 1) * x;
+            const boundary = THREE.MathUtils.clamp(curvedBoundary, bottom, top);
+            const offset = i * 6;
+
+            positions[offset] = x;
+            positions[offset + 1] = top;
+            positions[offset + 2] = 0;
+            positions[offset + 3] = x;
+            positions[offset + 4] = boundary;
+            positions[offset + 5] = 0;
+
+            // The original gradient plane is 35 × 35. These UVs sample the
+            // same texture coordinates after the facial-feature scale is applied.
+            const u = 0.5 + (ORBI_FACE_SCALE * (eyeX + x)) / 35;
+            const topV = 0.5 + (ORBI_FACE_SCALE * (eyeY + top)) / 35;
+            const boundaryV = 0.5 + (ORBI_FACE_SCALE * (eyeY + boundary)) / 35;
+            const uvOffset = i * 4;
+            uvs[uvOffset] = u;
+            uvs[uvOffset + 1] = topV;
+            uvs[uvOffset + 2] = u;
+            uvs[uvOffset + 3] = boundaryV;
+        }
+
+        positionAttribute.needsUpdate = true;
+        uvAttribute.needsUpdate = true;
+        geometry.computeBoundingSphere();
+
+        const lineCenterY = seamY + lidLineThickness / 2;
+        const lineChord = 2 * Math.sqrt(Math.max(0, radius * radius - lineCenterY * lineCenterY));
+        if (lidLineThickness > 0.002 && lineChord > 0.05) {
+            lidLineMesh.visible = true;
+            lidLineMesh.position.set(0, lineCenterY, 0.01);
+            lidLineMesh.scale.set(lineChord, lidLineThickness, 1);
+        } else {
+            lidLineMesh.visible = false;
+        }
+        return upperProgress;
+    }
+
+    update(0);
+    return { mesh, update, setLineThickness: (v) => { lidLineThickness = v; } };
+}
 // --- 5. The Eyes & Eyebrows ---
 const eyeData = []; 
 
-const blueMat = new THREE.MeshBasicMaterial({ color: 0x88C0FF, depthTest: false });
+const blueMat = new THREE.MeshBasicMaterial({ color: 0xF2F2F2, depthTest: false });
 const navyMat = new THREE.MeshBasicMaterial({ color: 0x0A1128, depthTest: false });
+const whiteMat = new THREE.MeshBasicMaterial({ color: 0xE0E0E0, depthTest: false });
 
 function createEye(xPos, yPos, index) {
     const eyeGroup = new THREE.Group();
@@ -107,75 +347,185 @@ function createEye(xPos, yPos, index) {
     pupilGroup.add(pupil);
     eyeGroup.add(pupilGroup);
     
-    // --- ROUNDED EYEBROWS ---
-    const browGeo = createPillShape(2.4, 0.35); 
+    // Dynamic Highlights
+    const highlightGroup = new THREE.Group();
+    const hlGeo = new THREE.CircleGeometry(0.2, 32);
+    const highlight = new THREE.Mesh(hlGeo, whiteMat);
+    highlight.position.set(-0.2, 0.2, 0.01); 
+    highlightGroup.add(highlight);
+    const hl2Geo = new THREE.CircleGeometry(0.1, 32);
+    const highlight2 = new THREE.Mesh(hl2Geo, whiteMat);
+    highlight2.position.set(0.2, -0.1, 0.01); 
+    highlightGroup.add(highlight2);
+    highlightGroup.visible = false; 
+    pupilGroup.add(highlightGroup);
+
+    // --- ROUNDED EYEBROWS (Longer outer edges) ---
+    // Increased total width to 3.4. 
+    const browGeo = createPillShape(BROW_LENGTH, BROW_THICKNESS); 
     const browMesh = new THREE.Mesh(browGeo, navyMat);
     
-    // Elongated inner sides
-    const innerShift = index === 0 ? 0.25 : -0.25;
-    browMesh.position.set(innerShift, 1.25, 0.05); 
-    browMesh.renderOrder = 1;
-    
+    // Shift outward slightly to make the outer side stretch further
+    const outerShift = (index === 0 ? -1 : 1) * (BROW_OUTER_END - BROW_LENGTH / 2);
+    browMesh.position.set(outerShift, 1.25, 0.05); 
+    browMesh.renderOrder = 4;
     eyeGroup.add(browMesh);
-    eyeGroup.userData.brow = browMesh; 
+
+    const upperLid = createUpperLidMask(xPos, yPos);
+    eyeGroup.add(upperLid.mesh);
 
     eyeData.push({ 
         group: eyeGroup, 
         normalEye, 
         happyEye, 
         pupilGroup, 
-        brow: browMesh
+        brow: browMesh,
+        highlights: highlightGroup,
+        upperLid
     });
 
     return eyeGroup;
 }
 
-const leftEye = createEye(-2.7, 1.8, 0);
-const rightEye = createEye(2.7, 1.8, 1);
-orbiGroup.add(leftEye);
-orbiGroup.add(rightEye);
+const leftEye = createEye(-2.1, 1.8, 0);
+const rightEye = createEye(2.1, 1.8, 1);
+facialFeaturesGroup.add(leftEye);
+facialFeaturesGroup.add(rightEye);
+
+// Independent targets for the left and right eyes.
+// Initial targets reproduce the current neutral appearance.
+const eyeExpressionController = new EyeExpressionController(THREE, {
+    smoothness: EYE_EXPRESSION_SMOOTHNESS
+});
 
 // --- 6. The Mouths ---
 const mouthGroup = new THREE.Group();
-mouthGroup.position.set(0, -1.0, 1);
+mouthGroup.position.set(0, -1.2, 1); 
 
-const neutralMesh = new THREE.Mesh(new THREE.CircleGeometry(0.45, 32), navyMat);
-
-const happyMesh = new THREE.Mesh(new THREE.TorusGeometry(1.4, 0.25, 16, 32, Math.PI), navyMat);
-happyMesh.rotation.z = Math.PI;
-happyMesh.position.y = 0.6;
-
+const neutralMesh = createSmile(1.0, -0.3, 0.15, navyMat); 
+const happyMesh = createSmile(2.0, -0.6, 0.25, navyMat);
+const sadMesh = createSmile(2.0, 0.6, 0.25, navyMat); 
 const surprisedMesh = new THREE.Mesh(new THREE.TorusGeometry(0.6, 0.2, 16, 32), navyMat);
+const pityMesh = new THREE.Mesh(new THREE.CircleGeometry(0.25, 32), navyMat);
+pityMesh.scale.set(1.2, 0.6, 1); 
 
-const sadMesh = new THREE.Mesh(new THREE.TorusGeometry(1.4, 0.25, 16, 32, Math.PI), navyMat);
-sadMesh.position.y = -0.6;
+const grumpyMesh = createSmile(0.85, 0.2, 0.15, navyMat);
+const judgingMesh = createSmile(0.6, 0, 0.14, navyMat);
+const unamusedMesh = createSmile(1.0, 0.3, 0.15, navyMat);
+const sleepyMesh = new THREE.Mesh(new THREE.CircleGeometry(0.13, 32), navyMat);
+mouthGroup.add(neutralMesh, happyMesh, surprisedMesh, sadMesh, pityMesh, grumpyMesh, judgingMesh, unamusedMesh, sleepyMesh);
 
-mouthGroup.add(neutralMesh, happyMesh, surprisedMesh, sadMesh);
-mouthGroup.children.forEach(m => { m.visible = false; m.renderOrder = 1; });
-orbiGroup.add(mouthGroup);
+// --- Floating "Z" for Sleepy (kept outside the face group so screen-motion bounds ignore it) ---
+const Z_COLOR = new THREE.Color(0x6A4FE0);
+const Z_BASE_X = -5.2;
+const Z_BASE_Y = 3.2;
+const zMat = new THREE.MeshBasicMaterial({ color: Z_COLOR, transparent: true, opacity: 0, depthTest: false, side: THREE.DoubleSide });
+const zShape = new THREE.Shape();
+[[-0.5, 0.5], [0.5, 0.5], [0.5, 0.32], [-0.12, -0.3], [0.5, -0.3], [0.5, -0.5], [-0.5, -0.5], [-0.5, -0.32], [0.12, 0.3], [-0.5, 0.3]]
+    .forEach((p, i) => { if (i === 0) zShape.moveTo(p[0], p[1]); else zShape.lineTo(p[0], p[1]); });
+zShape.closePath();
+const zMesh = new THREE.Mesh(new THREE.ShapeGeometry(zShape), zMat);
+zMesh.renderOrder = 6;
+zMesh.visible = false;
+orbiGroup.add(zMesh);
+let zTarget = 0;
+let zCurrent = 0;
+mouthGroup.children.forEach(m => { m.visible = false; });
+facialFeaturesGroup.add(mouthGroup);
 
 // --- 7. Expression Controller ---
 const EXPRESSIONS = {
-    neutral:   { happyEyes: false, pupilY: 0,    browY: 0,    browRot: 0,    browVisible: true, mouth: neutralMesh },
-    happy:     { happyEyes: true,  pupilY: 0,    browY: 0,    browRot: 0,    browVisible: false, mouth: happyMesh }, 
-    surprised: { happyEyes: false, pupilY: 0,    browY: 0.4,  browRot: -0.15, browVisible: true, mouth: surprisedMesh },
-    sad:       { happyEyes: false, pupilY: -0.2, browY: 0,    browRot: 0.4,  browVisible: true, mouth: sadMesh } 
+    // Shared fields apply to BOTH eyes. Optional left/right objects override one eye
+    // (lidClosure, browY, browRotation, pupilX, pupilY). glow: 1 = normal, above 1 = brighter, below 1 = dimmer.
+    neutral:   { happyEyes: false, pupilY: 0,    browY: 0,    browRot: 0,    showHighlights: false, mouth: neutralMesh },
+    happy:     { happyEyes: true,  pupilY: 0,    browY: 0,    browRot: 0,    showHighlights: false, mouth: happyMesh },
+    surprised: { happyEyes: false, pupilY: 0,    browY: 0.4,  browRot: -0.15, showHighlights: false, mouth: surprisedMesh, glow: 1.1 },
+    sad:       { happyEyes: false, pupilY: -0.2, browY: 0,    browRot: 0.4,  showHighlights: false, mouth: sadMesh },
+    pity:      { happyEyes: false, pupilY: 0.3,  browY: 0.1,  browRot: 0.5,  showHighlights: true,  mouth: pityMesh },
+    unamused:  { happyEyes: false, pupilY: 0.1, browY: 0, browRot: 0, showHighlights: false, mouth: unamusedMesh, squareBrows: true, browLock: 1, lidLine: 0.16, left: { lidClosure: 0.517 }, right: { lidClosure: 0.517 } },
+    sleepy:    { happyEyes: false, pupilY: 0, browY: 0, browRot: 0, showHighlights: false, mouth: sleepyMesh, glow: 0.55, sleepZ: true, left: { lidClosure: 1 }, right: { lidClosure: 1 } },
+    judging:   { happyEyes: false, pupilY: 0, browY: 0, browRot: 0, showHighlights: false, mouth: judgingMesh, left: { lidClosure: 0.3, browRotation: 0, pupilX: 0.3 }, right: { lidClosure: 0.3, browRotation: 0, pupilX: 0.3 } },
+    grumpy:    { happyEyes: false, pupilY: -0.12, browY: 0.1, browRot: 0.22, showHighlights: false, mouth: grumpyMesh, left: { lidClosure: 0.1, pupilX: -0.25 }, right: { lidClosure: 0.1, pupilX: -0.25 } }
 };
 
+// Sphere-style brightness channel. Eases slowly so waking and sleeping feel gradual.
+const GLOW_SMOOTHNESS = 2.5;
+const BLOOM_BASE_STRENGTH = 0.5;
+const BLOOM_GLOW_BOOST = 0;
+const SCLERA_BASE_COLOR = new THREE.Color(0xF2F2F2);
+const HIGHLIGHT_BASE_COLOR = new THREE.Color(0xE0E0E0);
+let glowTarget = 1;
+let glowCurrent = 1;
+const squareBrowGeometry = new THREE.PlaneGeometry(BROW_LENGTH, BROW_THICKNESS);
+let browLockTarget = 0;
+let browLockCurrent = 0;
+let lidLineTarget = 0;
+let lidLineCurrent = 0;
+
 let currentTarget = EXPRESSIONS.neutral;
+let currentExpressionName = 'neutral';
+
+function syncEyeStyle(side) {
+    const index = side === 'left' ? 0 : 1;
+    const data = eyeData[index];
+    const isHappy =
+        eyeExpressionController.getTarget(side).eyeStyle === 'happy';
+
+    data.normalEye.visible = !isHappy;
+    data.pupilGroup.visible = !isHappy;
+    data.happyEye.visible = isHappy;
+    data.upperLid.mesh.visible = !isHappy;
+}
 
 function setExpression(name) {
     if (!EXPRESSIONS[name]) return;
+
     currentTarget = EXPRESSIONS[name];
-    
+    currentExpressionName = name;
+
     mouthGroup.children.forEach(m => m.visible = false);
     currentTarget.mouth.visible = true;
 
+    const eyeStyle = currentTarget.happyEyes ? 'happy' : 'normal';
+
+    // Shared values first; optional per-eye overrides (left / right) win.
+    const leftBase = {
+        lidClosure: 0,
+        browY: currentTarget.browY,
+        browRotation: -currentTarget.browRot,
+        pupilX: 0,
+        pupilY: currentTarget.pupilY,
+        eyeStyle
+    };
+    const rightBase = {
+        lidClosure: 0,
+        browY: currentTarget.browY,
+        browRotation: currentTarget.browRot,
+        pupilX: 0,
+        pupilY: currentTarget.pupilY,
+        eyeStyle
+    };
+
+    eyeExpressionController.setEyeTargets({
+        left:  { ...leftBase,  ...(currentTarget.left  || {}) },
+        right: { ...rightBase, ...(currentTarget.right || {}) }
+    });
+
+    syncEyeStyle('left');
+    syncEyeStyle('right');
+
     eyeData.forEach(data => {
-        data.normalEye.visible = !currentTarget.happyEyes;
-        data.pupilGroup.visible = !currentTarget.happyEyes; 
-        data.happyEye.visible = currentTarget.happyEyes;
-        data.brow.visible = currentTarget.browVisible;
+        data.highlights.visible = currentTarget.showHighlights;
+    });
+
+    glowTarget = (currentTarget.glow !== undefined) ? currentTarget.glow : 1;
+
+    browLockTarget = currentTarget.browLock || 0;
+    lidLineTarget = currentTarget.lidLine || 0;
+    zTarget = currentTarget.sleepZ ? 1 : 0;
+    eyeData.forEach(data => {
+        if (!data.roundBrowGeometry) data.roundBrowGeometry = data.brow.geometry;
+        data.brow.geometry = currentTarget.squareBrows ? squareBrowGeometry : data.roundBrowGeometry;
     });
 }
 
@@ -184,9 +534,34 @@ window.addEventListener('keydown', (event) => {
     if (event.key === '2') setExpression('happy');
     if (event.key === '3') setExpression('surprised');
     if (event.key === '4') setExpression('sad');
+    if (event.key === '5') setExpression('pity');
+    if (event.key === '6') setExpression('grumpy');
+    if (event.key === '7') setExpression('judging');
+    if (event.key === '8') setExpression('unamused');
+    if (event.key === '9') setExpression('sleepy');
 });
 
 setExpression('neutral');
+
+// Future AI behaviour API.
+window.orbiEyeExpressions = Object.freeze({
+    setEyeTarget: (side, target) => {
+        eyeExpressionController.setEyeTarget(side, target);
+        syncEyeStyle(side);
+        return eyeExpressionController.getTarget(side);
+    },
+
+    setEyeTargets: (targets) => {
+        eyeExpressionController.setEyeTargets(targets);
+        syncEyeStyle('left');
+        syncEyeStyle('right');
+        return eyeExpressionController.getTargets();
+    },
+
+    reset: () => setExpression(currentExpressionName),
+
+    getState: (side) => eyeExpressionController.getState(side)
+});
 
 // --- 8. Post-Processing ---
 const renderScene = new RenderPass(scene, camera);
@@ -199,6 +574,28 @@ composer.addPass(renderScene);
 composer.addPass(bloomPass);
 composer.addPass(smaaPass); 
 composer.addPass(outputPass);
+
+// Screen movement is a parent transform of both faceBase and facialFeaturesGroup.
+// This keeps the radial glow spatially attached to Orbi while it travels.
+const screenMotionController = new ScreenMotionController(THREE, {
+    motionRoot: screenMotionRoot,
+    subject: facialFeaturesGroup,
+    background: faceBase,
+    camera,
+    speed: SCREEN_MOTION_SPEED,
+    margin: SCREEN_MOTION_MARGIN,
+    enabled: SCREEN_MOTION_ENABLED
+});
+
+// A small API for future AI behaviours and controlled manual testing.
+// Movement remains disabled by default; enable it explicitly when ready.
+window.orbiScreenMotion = Object.freeze({
+    moveTo: (normalizedX, normalizedY) => screenMotionController.moveTo(normalizedX, normalizedY),
+    center: () => screenMotionController.moveTo(0, 0),
+    setEnabled: (enabled) => screenMotionController.setEnabled(enabled),
+    refreshBounds: () => screenMotionController.refreshBounds()
+});
+
 
 // --- 9. Mouse Tracking & Smooth Return ---
 let desiredX = 0; 
@@ -214,41 +611,65 @@ window.addEventListener('mousemove', (event) => {
 });
 
 // --- 10. Blink Controller ---
-let isBlinking = false;
+let blinkPhase = 'open';
+let blinkProgress = 0;
+let blinkDirection = 'closing';
+let blinkPhaseStartedAt = 0;
 let lastBlinkTime = Date.now();
-let nextBlinkDelay = Math.random() * 4000 + 4000; 
-let blinkStartTime = 0;
-const blinkDuration = 150; 
+let nextBlinkDelay = Math.random() * 4000 + 4000;
+
+function beginBlink(now = Date.now()) {
+    if (blinkPhase !== 'open' || currentTarget.happyEyes) return;
+    blinkPhase = 'closing';
+    blinkDirection = 'closing';
+    blinkPhaseStartedAt = now;
+}
 
 window.addEventListener('keydown', (event) => {
-    if (event.code === 'Space' && !isBlinking && !currentTarget.happyEyes) {
-        isBlinking = true;
-        blinkStartTime = Date.now();
-    }
+    if (event.code === 'Space') beginBlink();
 });
 
 function updateBlink() {
     const now = Date.now();
-    if (!isBlinking) {
+
+    if (blinkPhase === 'open') {
+        blinkProgress = 0;
         if (now - lastBlinkTime > nextBlinkDelay) {
-            isBlinking = true;
-            blinkStartTime = now;
+            blinkPhase = 'closing';
+            blinkDirection = 'closing';
+            blinkPhaseStartedAt = now;
         }
-    } else {
-        const progress = (now - blinkStartTime) / blinkDuration;
-        if (progress >= 1) {
-            isBlinking = false;
+    } else if (blinkPhase === 'closing') {
+        const t = THREE.MathUtils.clamp((now - blinkPhaseStartedAt) / BLINK_CLOSE_MS, 0, 1);
+        blinkProgress = t;
+        if (t >= 1) {
+            blinkPhase = 'closed-hold';
+            blinkPhaseStartedAt = now;
+            blinkProgress = 1;
+        }
+    } else if (blinkPhase === 'closed-hold') {
+        blinkProgress = 1;
+        if (now - blinkPhaseStartedAt >= BLINK_CLOSED_HOLD_MS) {
+            blinkPhase = 'opening';
+            blinkDirection = 'opening';
+            blinkPhaseStartedAt = now;
+        }
+    } else if (blinkPhase === 'opening') {
+        const t = THREE.MathUtils.clamp((now - blinkPhaseStartedAt) / BLINK_OPEN_MS, 0, 1);
+        blinkProgress = 1 - t;
+        if (t >= 1) {
+            blinkProgress = 0;
+            blinkPhase = 'open';
             lastBlinkTime = now;
             nextBlinkDelay = Math.random() * 4000 + 4000;
         }
     }
+
+    return blinkProgress;
 }
 
 // --- 11. Animation Loop ---
 const clock = new THREE.Clock();
-let currentBrowRot = 0;
-let currentBrowY = 0;
-let currentPupilY = 0;
 
 function animate() {
     requestAnimationFrame(animate);
@@ -264,51 +685,100 @@ function animate() {
     currentX = THREE.MathUtils.damp(currentX, desiredX, activeSpeed, delta);
     currentY = THREE.MathUtils.damp(currentY, desiredY, activeSpeed, delta);
 
-    currentBrowRot = THREE.MathUtils.damp(currentBrowRot, currentTarget.browRot, 10, delta);
-    currentBrowY = THREE.MathUtils.damp(currentBrowY, currentTarget.browY, 10, delta);
-    currentPupilY = THREE.MathUtils.damp(currentPupilY, currentTarget.pupilY, 10, delta);
+    // Move the complete visual composition; its gradient and face share one transform.
+    screenMotionController.update(delta);
 
-    const pupilMaxMove = 0.4; 
-    eyeData.forEach((data, index) => {
-        data.pupilGroup.position.x = (currentX * pupilMaxMove);
-        data.pupilGroup.position.y = (currentY * pupilMaxMove) + currentPupilY;
-    });
+    const eyeStates = eyeExpressionController.update(delta);
 
-    updateBlink();
-    let blinkScale = 1.0;
-    if (isBlinking) {
-        const progress = (Date.now() - blinkStartTime) / blinkDuration;
-        blinkScale = Math.max(0.05, Math.abs(Math.cos(progress * Math.PI)));
-    }
+    const pupilMaxMove = 0.4;
+    const PUPIL_MAX_REACH = 0.62;
 
     eyeData.forEach((data, index) => {
-        if (!currentTarget.happyEyes) {
-            // 1. Squish the eye down. Stretch X slightly to make it look like a natural fold.
-            data.normalEye.scale.y = blinkScale;
-            data.normalEye.scale.x = 1 + (1 - blinkScale) * 0.2;
-            
-            data.pupilGroup.scale.y = blinkScale; 
-            data.pupilGroup.scale.x = 1 + (1 - blinkScale) * 0.2;
+        const side = index === 0 ? 'left' : 'right';
+        const eyeState = eyeStates[side];
 
-            // 2. Eyebrow acts as the eyelid: Drops from 1.25 perfectly down to the center (0)
-            // When blinkScale is 1 (open), offset is 0. When blinkScale is 0 (closed), offset is -1.25.
-            const browDrop = (1 - blinkScale) * 1.25;
-            data.brow.position.y = 1.25 + currentBrowY - browDrop;
-            
-        } else {
-            data.brow.position.y = 1.25 + currentBrowY;
-            data.normalEye.scale.set(1, 1, 1); // Reset if happy
+        data.pupilGroup.position.x =
+            (currentX * pupilMaxMove) + eyeState.pupilX;
+
+        data.pupilGroup.position.y =
+            (currentY * pupilMaxMove) + eyeState.pupilY;
+        // Keep each pupil fully inside its eye (eye radius 1.3 minus pupil radius 0.65, with a small margin).
+        {
+            const reach = Math.hypot(data.pupilGroup.position.x, data.pupilGroup.position.y);
+            if (reach > PUPIL_MAX_REACH) {
+                const k = PUPIL_MAX_REACH / reach;
+                data.pupilGroup.position.x *= k;
+                data.pupilGroup.position.y *= k;
+            }
         }
 
-        const rotDir = index === 0 ? -1 : 1;
-        data.brow.rotation.z = rotDir * currentBrowRot;
-    });
+        if (currentTarget.showHighlights) {
+            const wobbleX = Math.sin(time * 5 + index) * 0.05;
+            const wobbleY = Math.cos(time * 4 + index) * 0.05;
+            const reflectX = -currentX * 0.2;
+            const reflectY = -currentY * 0.2;
 
-    const lightShift = 0.02;
+            data.highlights.position.x = wobbleX + reflectX;
+            data.highlights.position.y = wobbleY + reflectY;
+        }
+    });
+    const blinkProgress = updateBlink();
+
+    eyeData.forEach((data, index) => {
+        const side = index === 0 ? 'left' : 'right';
+        const eyeState = eyeStates[side];
+
+        const blinkInfluence = eyeState.eyeStyle === 'happy'
+            ? 0
+            : data.upperLid.update(
+                blinkProgress,
+                blinkDirection, eyeState.lidClosure, Math.tan(eyeState.browRotation * (1 - eyeState.lidClosure))
+            );
+
+        // Each eyebrow follows its own upper eyelid.
+        const lockBase = browLockCurrent * THREE.MathUtils.clamp(eyeState.lidClosure, 0, 1);
+        const browFollowInfluence = Math.max(0, (blinkInfluence - lockBase) / Math.max(0.0001, 1 - lockBase));
+        const browDrop =
+            browFollowInfluence *
+            BLINK_BROW_DROP_DISTANCE *
+            BLINK_BROW_FOLLOW;
+
+        data.brow.position.y =
+            BLINK_BROW_BASE_Y + eyeState.browY - browDrop;
+
+        data.brow.rotation.z =
+            eyeState.browRotation *
+            (1 - blinkInfluence * BLINK_BROW_ROTATION_RELAX);
+    });    // Keep this subtle gaze parallax separate from character movement.
+    // The face and radial gradient themselves move together via screenMotionRoot.
+    const lightShift = GRADIENT_GAZE_PARALLAX_STRENGTH;
     faceMaterial.map.offset.x = -currentX * lightShift;
     faceMaterial.map.offset.y = currentY * lightShift;
 
-    orbiGroup.scale.setScalar(1 + Math.sin(time * 2) * 0.005);
+    // Sphere-style brightness: brighter on big reactions, dimmer when sleepy.
+    glowCurrent = THREE.MathUtils.damp(glowCurrent, glowTarget, GLOW_SMOOTHNESS, delta);
+    browLockCurrent = (browLockTarget > browLockCurrent) ? browLockTarget : THREE.MathUtils.damp(browLockCurrent, browLockTarget, 10, delta);
+    lidLineCurrent = THREE.MathUtils.damp(lidLineCurrent, lidLineTarget, 10, delta);
+    eyeData.forEach(d => d.upperLid.setLineThickness(lidLineCurrent));
+
+    // Floating Z: drifts up and fades, repeating while Sleepy.
+    zCurrent = THREE.MathUtils.damp(zCurrent, zTarget, 3, delta);
+    {
+        const zPhase = (time * 0.45) % 1;
+        const zScale = (0.75 + zPhase * 0.35) * 1.3;
+        zMesh.position.set(Z_BASE_X + Math.sin(time * 1.3) * 0.12, Z_BASE_Y + zPhase * 0.9, 1);
+        zMesh.scale.set(zScale, zScale, 1);
+        zMat.opacity = zCurrent * Math.sin(zPhase * Math.PI);
+        zMat.color.copy(Z_COLOR).multiplyScalar(Math.min(glowCurrent, 1));
+        zMesh.visible = zMat.opacity > 0.01;
+    }
+    faceMaterial.color.setScalar(glowCurrent);
+    upperLidMaterial.color.setScalar(glowCurrent);
+    blueMat.color.copy(SCLERA_BASE_COLOR).multiplyScalar(Math.min(glowCurrent, 1));
+    whiteMat.color.copy(HIGHLIGHT_BASE_COLOR).multiplyScalar(Math.min(glowCurrent, 1));
+    bloomPass.strength = BLOOM_BASE_STRENGTH + Math.max(0, glowCurrent - 1) * BLOOM_GLOW_BOOST;
+
+orbiGroup.scale.setScalar(1 + Math.sin(time * 2) * 0.005);
 
     composer.render();
 }
@@ -320,6 +790,7 @@ window.addEventListener('resize', () => {
     camera.top = viewSize / 2;
     camera.bottom = -viewSize / 2;
     camera.updateProjectionMatrix();
+    screenMotionController.refreshBounds();
     renderer.setSize(window.innerWidth, window.innerHeight);
     smaaPass.setSize(window.innerWidth * renderer.getPixelRatio(), window.innerHeight * renderer.getPixelRatio());
     composer.setSize(window.innerWidth, window.innerHeight);

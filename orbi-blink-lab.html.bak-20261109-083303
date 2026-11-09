@@ -1,0 +1,472 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Orbi Blink Lab</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    background: #f1cb2e;
+}
+
+body {
+    font-family: Arial, sans-serif;
+}
+
+canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    position: fixed;
+    inset: 0;
+}
+
+#controls {
+
+    position: fixed;
+
+    z-index: 10;
+
+    left: 20px;
+    bottom: 20px;
+
+    display: flex;
+
+    gap: 8px;
+
+    padding: 10px;
+
+    background: rgba(7, 28, 52, 0.88);
+
+    border: 1px solid rgba(255,255,255,0.16);
+
+    border-radius: 12px;
+
+    color: white;
+
+    backdrop-filter: blur(12px);
+
+}
+
+button {
+
+    border: 0;
+
+    border-radius: 8px;
+
+    padding: 10px 15px;
+
+    background: #e8f3ff;
+
+    color: #071c34;
+
+    font-weight: 700;
+
+    cursor: pointer;
+
+}
+
+button:hover {
+    background: white;
+}
+
+#instructions {
+
+    position: fixed;
+
+    z-index: 10;
+
+    top: 20px;
+
+    left: 20px;
+
+    color: #071c34;
+
+    font-size: 13px;
+
+    font-weight: 700;
+
+    text-shadow: 0 1px rgba(255,255,255,0.25);
+
+}
+
+</style>
+
+<!-- Use the same Three.js version for the core module and addons. -->
+
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js"
+    }
+}
+</script>
+
+</head>
+
+<body>
+
+<div id="instructions">
+    ORBI BLINK LAB | SPACE = BLINK | S = SLEEP / WAKE
+</div>
+
+<div id="controls">
+
+    <button id="blinkButton">Blink</button>
+
+    <button id="sleepButton">Sleep</button>
+
+</div>
+
+<script type="module">
+
+import * as THREE from "three";
+
+import {
+    createEyeRig,
+    createBlinkController
+} from "./orbi-blink-lab.js";
+
+
+/* =========================================================
+   SCENE
+   Flat full-screen yellow display.
+   No physical sphere or dome.
+========================================================= */
+
+const scene = new THREE.Scene();
+
+const FACE_COLOR = 0xf1cb2e;
+
+scene.background = new THREE.Color(FACE_COLOR);
+
+
+/* =========================================================
+   CAMERA
+========================================================= */
+
+const camera = new THREE.OrthographicCamera(
+    -5,
+    5,
+    4,
+    -4,
+    0.1,
+    100
+);
+
+camera.position.set(0, 0, 20);
+
+camera.lookAt(0, 0, 0);
+
+
+/* =========================================================
+   RENDERER
+========================================================= */
+
+const renderer = new THREE.WebGLRenderer({
+
+    antialias: true,
+
+    alpha: false,
+
+    powerPreference: "high-performance"
+
+});
+
+renderer.setPixelRatio(
+    Math.min(window.devicePixelRatio || 1, 1.5)
+);
+
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+renderer.domElement.id = "orbiCanvas";
+
+document.body.appendChild(renderer.domElement);
+
+
+/* =========================================================
+   FACE GROUP
+========================================================= */
+
+const faceRoot = new THREE.Group();
+
+scene.add(faceRoot);
+
+
+/* =========================================================
+   LEFT EYE
+========================================================= */
+
+const leftEye = createEyeRig({
+
+    x: -1.8,
+
+    y: 0.4,
+
+    radius: 1.3,
+
+    faceColor: FACE_COLOR,
+
+    eyeColor: 0x4b9bd8,
+
+    pupilColor: 0x071c34,
+
+    browColor: 0x071c34,
+
+    browTilt: 0.055,
+
+    browWidth: 3.0,
+
+    browHeight: 0.35,
+
+    browY: 1.25,
+
+    upperTravelShare: 0.80
+
+});
+
+faceRoot.add(leftEye.root);
+
+
+/* =========================================================
+   RIGHT EYE
+========================================================= */
+
+const rightEye = createEyeRig({
+
+    x: 1.8,
+
+    y: 0.4,
+
+    radius: 1.3,
+
+    faceColor: FACE_COLOR,
+
+    eyeColor: 0x4b9bd8,
+
+    pupilColor: 0x071c34,
+
+    browColor: 0x071c34,
+
+    browTilt: -0.055,
+
+    browWidth: 3.0,
+
+    browHeight: 0.35,
+
+    browY: 1.25,
+
+    upperTravelShare: 0.80
+
+});
+
+faceRoot.add(rightEye.root);
+
+
+/* =========================================================
+   SIMPLE STATIC SMILE
+   Included only to make the eye test look like Orbi.
+========================================================= */
+
+const smileCurve = new THREE.CatmullRomCurve3([
+
+    new THREE.Vector3(-0.85, -1.95, 0.10),
+
+    new THREE.Vector3(0, -2.35, 0.10),
+
+    new THREE.Vector3(0.85, -1.95, 0.10)
+
+]);
+
+const smile = new THREE.Mesh(
+
+    new THREE.TubeGeometry(
+        smileCurve,
+        48,
+        0.065,
+        10,
+        false
+    ),
+
+    new THREE.MeshBasicMaterial({
+        color: 0x071c34,
+        toneMapped: false
+    })
+
+);
+
+faceRoot.add(smile);
+
+
+/* =========================================================
+   RESPONSIVE DISPLAY
+========================================================= */
+
+function resize() {
+
+    const width = window.innerWidth;
+
+    const height = window.innerHeight;
+
+    const aspect = width / height;
+
+    const viewHeight = 8.2;
+
+    camera.left = -viewHeight * aspect / 2;
+
+    camera.right = viewHeight * aspect / 2;
+
+    camera.top = viewHeight / 2;
+
+    camera.bottom = -viewHeight / 2;
+
+    camera.updateProjectionMatrix();
+
+    // Preserve facial proportions on portrait displays.
+    const fit = Math.min(1, aspect / 1.2);
+
+    faceRoot.scale.setScalar(1.25 * fit);
+
+    renderer.setSize(width, height, false);
+
+}
+
+window.addEventListener("resize", resize);
+
+resize();
+
+
+/* =========================================================
+   BLINK CONTROLLER
+========================================================= */
+
+const blinkController = createBlinkController(
+
+    [leftEye, rightEye],
+
+    {
+
+        autoBlink: true,
+
+        closeMs: 90,
+
+        holdMs: 10,
+
+        openMs: 170,
+
+        sleepDamping: 12,
+
+        autoMinSeconds: 2.5,
+
+        autoMaxSeconds: 5.0
+
+    }
+
+);
+
+
+/* =========================================================
+   BUTTONS
+========================================================= */
+
+const blinkButton = document.getElementById("blinkButton");
+
+const sleepButton = document.getElementById("sleepButton");
+
+blinkButton.addEventListener("click", () => {
+
+    blinkController.triggerBlink();
+
+});
+
+let sleeping = false;
+
+sleepButton.addEventListener("click", () => {
+
+    sleeping = !sleeping;
+
+    blinkController.setSleeping(sleeping);
+
+    sleepButton.textContent = sleeping ? "Wake" : "Sleep";
+
+});
+
+
+/* =========================================================
+   KEYBOARD CONTROLS
+========================================================= */
+
+window.addEventListener("keydown", event => {
+
+    if (event.code === "Space") {
+
+        event.preventDefault();
+
+        blinkController.triggerBlink();
+
+    }
+
+    if (event.key.toLowerCase() === "s") {
+
+        sleeping = !sleeping;
+
+        blinkController.setSleeping(sleeping);
+
+        sleepButton.textContent = sleeping ? "Wake" : "Sleep";
+
+    }
+
+});
+
+
+/* =========================================================
+   ANIMATION LOOP
+========================================================= */
+
+let previousTime = 0;
+
+function animate(currentTime) {
+
+    requestAnimationFrame(animate);
+
+    const deltaTime = previousTime === 0
+
+        ? 0
+
+        : Math.min(
+            (currentTime - previousTime) / 1000,
+            0.05
+        );
+
+    previousTime = currentTime;
+
+    // The controller updates both eyes and their eyebrows.
+    blinkController.update(deltaTime);
+
+    renderer.render(scene, camera);
+
+}
+
+requestAnimationFrame(animate);
+
+
+</script>
+
+</body>
+
+</html>

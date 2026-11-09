@@ -1,0 +1,88 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#F6C900" />
+  <title>Orbi — Blink Lab</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #F6C900;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%; margin: 0; overflow: hidden;
+      background: #F6C900;
+    }
+    body { position: fixed; inset: 0; }
+    canvas#orbi-canvas {
+      position: absolute; inset: 0; display: block;
+      width: 100%; height: 100%; outline: none;
+    }
+    .brand {
+      position: fixed; top: 18px; left: 20px; z-index: 5;
+      display: flex; align-items: center; gap: 9px;
+      color: #10182F; user-select: none; pointer-events: none;
+    }
+    .brand-mark {
+      display: grid; place-items: center; width: 29px; height: 29px;
+      border: 2px solid rgba(16,24,47,.72); border-radius: 50%;
+      font-size: 15px; font-weight: 900;
+    }
+    .brand-name { font-size: 12px; font-weight: 900; letter-spacing: .15em; }
+    .brand-sub { margin-top: 2px; font-size: 9px; font-weight: 700; letter-spacing: .16em; opacity: .62; }
+    .toolbar {
+      position: fixed; right: 18px; top: 16px; z-index: 5;
+      display: flex; align-items: center; gap: 8px;
+    }
+    button {
+      min-height: 36px; padding: 0 13px; border: 1px solid rgba(16,24,47,.2);
+      border-radius: 999px; background: rgba(255,226,70,.72);
+      color: #10182F; font: 800 10px/1 Inter, ui-sans-serif, system-ui, sans-serif;
+      letter-spacing: .12em; cursor: pointer; transition: transform .15s ease, background .15s ease;
+      backdrop-filter: blur(8px);
+    }
+    button:hover { transform: translateY(-1px); background: rgba(255,239,133,.94); }
+    button:active { transform: translateY(0) scale(.97); }
+    button:disabled { opacity: .42; cursor: default; transform: none; }
+    #sleep-button { background: #10182F; color: #F6D94D; border-color: #10182F; }
+    #sleep-button:hover { background: #202B4A; }
+    .status {
+      position: fixed; left: 50%; bottom: 16px; z-index: 5;
+      transform: translateX(-50%); color: rgba(16,24,47,.62);
+      font-size: 9px; font-weight: 800; letter-spacing: .18em;
+      user-select: none; pointer-events: none;
+    }
+    @media (max-width: 560px) {
+      .brand { top: 12px; left: 12px; }
+      .brand-sub { display: none; }
+      .toolbar { top: 10px; right: 10px; gap: 5px; }
+      button { min-height: 32px; padding: 0 10px; font-size: 9px; }
+    }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div class="brand" aria-hidden="true">
+    <div class="brand-mark">O</div>
+    <div>
+      <div class="brand-name">ORBI</div>
+      <div class="brand-sub">BLINK LAB</div>
+    </div>
+  </div>
+  <div class="toolbar" aria-label="Orbi blink controls">
+    <button id="blink-button" type="button">BLINK</button>
+    <button id="sleep-button" type="button" aria-pressed="false">SLEEP</button>
+  </div>
+  <div class="status" id="status-text">READY · SPACE TO BLINK · S TO SLEEP</div>
+  <script type="module" src="./orbi-blink-lab.js"></script>
+</body>
+</html>

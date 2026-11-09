@@ -1,0 +1,359 @@
+﻿import * as THREE from 'three';
+
+// ORBI BLINK LAB — smooth-motion pass. Eye and pupil geometry never scale.
+const FACE_YELLOW = 0xF6C900;
+const EYE_BLUE = 0x39A9E8;
+const PUPIL_NAVY = 0x10182F;
+const WHITE = 0xFFFFFF;
+const EYE_RADIUS = 1.30;
+const PUPIL_RADIUS = 0.65;
+const CLOSED_SEAM_Y = -0.84;
+const OPEN_SEAM_Y = 1.39;
+// The upper lid does most of the closing; the lower yellow lid completes it.
+const UPPER_FINISH_AT = 0.86;
+const LOWER_START_AT = 0.80;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(FACE_YELLOW);
+
+const camera = new THREE.OrthographicCamera(-4, 4, 2.25, -2.25, 0.1, 100);
+camera.position.set(0, -0.375, 20);
+camera.lookAt(0, -0.375, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.domElement.id = 'orbi-canvas';
+document.body.appendChild(renderer.domElement);
+
+const faceRoot = new THREE.Group();
+scene.add(faceRoot);
+
+const eyeWhiteMaterial = new THREE.MeshBasicMaterial({ color: EYE_BLUE });
+const pupilMaterial = new THREE.MeshBasicMaterial({ color: PUPIL_NAVY });
+const highlightMaterial = new THREE.MeshBasicMaterial({ color: WHITE });
+const lidMaterial = new THREE.MeshBasicMaterial({
+  color: FACE_YELLOW,
+  side: THREE.DoubleSide,
+  depthWrite: true
+});
+const browMaterial = new THREE.MeshBasicMaterial({ color: PUPIL_NAVY });
+const mouthMaterial = new THREE.MeshBasicMaterial({ color: PUPIL_NAVY });
+
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+const lerp = (a, b, t) => a + (b - a) * t;
+// Quintic smootherstep has zero velocity and acceleration at both ends.
+const smootherstep01 = (value) => {
+  const t = clamp(value, 0, 1);
+  return t * t * t * (t * (t * 6 - 15) + 10);
+};
+const randomBetween = (min, max) => min + Math.random() * (max - min);
+
+function roundedPillGeometry(width, height, radius) {
+  const w = width / 2;
+  const h = height / 2;
+  const r = Math.min(radius, h, w);
+  const shape = new THREE.Shape();
+  shape.moveTo(-w + r, -h);
+  shape.lineTo(w - r, -h);
+  shape.quadraticCurveTo(w, -h, w, -h + r);
+  shape.lineTo(w, h - r);
+  shape.quadraticCurveTo(w, h, w - r, h);
+  shape.lineTo(-w + r, h);
+  shape.quadraticCurveTo(-w, h, -w, h - r);
+  shape.lineTo(-w, -h + r);
+  shape.quadraticCurveTo(-w, -h, -w + r, -h);
+  return new THREE.ShapeGeometry(shape, 12);
+}
+
+// A reusable strip clipped to the circular eye. Only the yellow mask boundary
+// moves; the circular sclera and pupil meshes remain completely unchanged.
+function makeLidBand(upper) {
+  const segments = 120;
+  const positions = new Float32Array((segments + 1) * 2 * 3);
+  const indices = [];
+  for (let i = 0; i < segments; i += 1) {
+    const a = i * 2;
+    const b = a + 1;
+    const c = a + 2;
+    const d = a + 3;
+    indices.push(a, b, c, b, d, c);
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setIndex(indices);
+  const mesh = new THREE.Mesh(geometry, lidMaterial);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = upper ? 4 : 3;
+
+  function update(centerY) {
+    const attribute = geometry.getAttribute('position');
+    for (let i = 0; i <= segments; i += 1) {
+      const x = -EYE_RADIUS + (2 * EYE_RADIUS * i) / segments;
+      const halfHeight = Math.sqrt(Math.max(0, EYE_RADIUS * EYE_RADIUS - x * x));
+      const bottom = -halfHeight;
+      const top = halfHeight;
+      const curvedBoundary = centerY + 0.06 * Math.pow(x / EYE_RADIUS, 2);
+      const boundary = clamp(curvedBoundary, bottom, top);
+      const yA = upper ? top : bottom;
+      const yB = boundary;
+      const offset = i * 6;
+      positions[offset] = x;
+      positions[offset + 1] = yA;
+      positions[offset + 2] = 0;
+      positions[offset + 3] = x;
+      positions[offset + 4] = yB;
+      positions[offset + 5] = 0;
+    }
+    attribute.needsUpdate = true;
+    geometry.computeBoundingSphere();
+  }
+
+  return { mesh, update };
+}
+
+function makeEye(centerX, isLeft) {
+  const eyeRoot = new THREE.Group();
+  eyeRoot.position.set(centerX, 0, 0);
+  faceRoot.add(eyeRoot);
+
+  // Fixed circular sclera.
+  const sclera = new THREE.Mesh(
+    new THREE.CircleGeometry(EYE_RADIUS, 96),
+    eyeWhiteMaterial
+  );
+  sclera.position.z = 0.02;
+  eyeRoot.add(sclera);
+
+  // Fixed pupil group: never scaled or moved during a blink.
+  const pupilGroup = new THREE.Group();
+  pupilGroup.position.set(isLeft ? 0.06 : -0.06, 0.02, 0.035);
+  eyeRoot.add(pupilGroup);
+  const pupil = new THREE.Mesh(
+    new THREE.CircleGeometry(PUPIL_RADIUS, 80),
+    pupilMaterial
+  );
+  pupilGroup.add(pupil);
+
+  const highlight = new THREE.Mesh(
+    new THREE.CircleGeometry(0.13, 32),
+    highlightMaterial
+  );
+  highlight.position.set(-0.22, 0.25, 0.01);
+  pupilGroup.add(highlight);
+
+  // Upper yellow lid and eyebrow are driven by the same coverage value.
+  const upperLidGroup = new THREE.Group();
+  eyeRoot.add(upperLidGroup);
+  const upperBand = makeLidBand(true);
+  upperBand.mesh.position.z = 0.075;
+  upperLidGroup.add(upperBand.mesh);
+
+  const browGroup = new THREE.Group();
+  browGroup.position.set(isLeft ? 0.12 : -0.12, 1.28, 0.11);
+  upperLidGroup.add(browGroup);
+  const brow = new THREE.Mesh(
+    roundedPillGeometry(3.0, 0.34, 0.17),
+    browMaterial
+  );
+  browGroup.add(brow);
+
+  // The lower lid is yellow only. It creates no black edge or crease.
+  const lowerBand = makeLidBand(false);
+  lowerBand.mesh.position.z = 0.085;
+  eyeRoot.add(lowerBand.mesh);
+
+  const openAngle = isLeft ? 0.055 : -0.055;
+
+  function update(progress) {
+    // Both lids use the same master timeline, with overlapping eased phases.
+    // This prevents a sudden hand-off between upper and lower eyelids.
+    const upperProgress = smootherstep01(progress / UPPER_FINISH_AT);
+    const lowerProgress = smootherstep01(
+      (progress - LOWER_START_AT) / (1 - LOWER_START_AT)
+    );
+    const seamY = lerp(OPEN_SEAM_Y, CLOSED_SEAM_Y, upperProgress);
+    const lowerFrontierY = lerp(-EYE_RADIUS, seamY, lowerProgress);
+
+    upperBand.update(seamY);
+    lowerBand.update(lowerFrontierY);
+
+    // The real eyebrow itself becomes the visible closed-eye line.
+    browGroup.position.y = lerp(1.28, CLOSED_SEAM_Y, upperProgress);
+    browGroup.rotation.z = lerp(openAngle, 0, upperProgress);
+  }
+
+  update(0);
+  return { update };
+}
+
+const leftEye = makeEye(-1.80, true);
+const rightEye = makeEye(1.80, false);
+
+// Fixed smile: no unnecessary face motion is added to the blink test.
+const smileCurve = new THREE.CatmullRomCurve3([
+  new THREE.Vector3(-1.12, -1.62, 0.06),
+  new THREE.Vector3(-0.68, -1.94, 0.06),
+  new THREE.Vector3(0, -2.06, 0.06),
+  new THREE.Vector3(0.68, -1.94, 0.06),
+  new THREE.Vector3(1.12, -1.62, 0.06)
+]);
+const smile = new THREE.Mesh(
+  new THREE.TubeGeometry(smileCurve, 64, 0.065, 10, false),
+  mouthMaterial
+);
+faceRoot.add(smile);
+
+// Keep the screen-filling composition from the previous lab version.
+const FACE_BOUNDS = {
+  minX: -3.50,
+  maxX: 3.50,
+  minY: -2.30,
+  maxY: 1.55
+};
+
+function resize() {
+  const width = Math.max(1, window.innerWidth);
+  const height = Math.max(1, window.innerHeight);
+  const aspect = width / height;
+  const boundsWidth = FACE_BOUNDS.maxX - FACE_BOUNDS.minX;
+  const boundsHeight = FACE_BOUNDS.maxY - FACE_BOUNDS.minY;
+  const centerX = (FACE_BOUNDS.minX + FACE_BOUNDS.maxX) / 2;
+  const centerY = (FACE_BOUNDS.minY + FACE_BOUNDS.maxY) / 2;
+  const viewWidthForWidth = boundsWidth / 0.90;
+  const viewHeightForHeight = boundsHeight / 0.88;
+  const viewWidth = Math.max(viewWidthForWidth, viewHeightForHeight * aspect);
+  const viewHeight = viewWidth / aspect;
+
+  camera.left = -viewWidth / 2;
+  camera.right = viewWidth / 2;
+  camera.top = viewHeight / 2;
+  camera.bottom = -viewHeight / 2;
+  camera.position.set(centerX, centerY, 20);
+  camera.lookAt(centerX, centerY, 0);
+  camera.updateProjectionMatrix();
+  renderer.setSize(width, height, false);
+}
+window.addEventListener('resize', resize, { passive: true });
+resize();
+
+const blinkButton = document.getElementById('blink-button');
+const sleepButton = document.getElementById('sleep-button');
+const statusText = document.getElementById('status-text');
+
+let progress = 0;
+let phase = 'open';
+let phaseStartedAt = performance.now();
+let phaseStartProgress = 0;
+let nextAutomaticBlink = performance.now() + randomBetween(2800, 4600);
+let sleeping = false;
+
+// Linear master timing plus eased lid geometry avoids double-easing. The
+// resulting motion starts and stops gently while retaining a natural blink.
+const CLOSE_MS = 115;
+const CLOSED_HOLD_MS = 45;
+const OPEN_MS = 190;
+const SLEEP_CLOSE_MS = 900;
+const WAKE_OPEN_MS = 760;
+
+function beginBlink(now = performance.now()) {
+  if (sleeping || phase !== 'open') return;
+  phase = 'closing';
+  phaseStartedAt = now;
+  phaseStartProgress = progress;
+  statusText.textContent = 'BLINK';
+}
+
+function toggleSleep() {
+  const now = performance.now();
+  if (!sleeping) {
+    sleeping = true;
+    phase = 'sleep-closing';
+    phaseStartedAt = now;
+    phaseStartProgress = progress;
+    sleepButton.textContent = 'WAKE';
+    sleepButton.setAttribute('aria-pressed', 'true');
+    blinkButton.disabled = true;
+    statusText.textContent = 'GOING TO SLEEP';
+  } else {
+    sleeping = false;
+    phase = 'waking';
+    phaseStartedAt = now;
+    phaseStartProgress = progress;
+    sleepButton.textContent = 'SLEEP';
+    sleepButton.setAttribute('aria-pressed', 'false');
+    blinkButton.disabled = false;
+    statusText.textContent = 'WAKING';
+  }
+}
+
+function updateAnimation(now) {
+  if (phase === 'open') {
+    progress = 0;
+    if (!sleeping && now >= nextAutomaticBlink) beginBlink(now);
+  } else if (phase === 'closing') {
+    const t = clamp((now - phaseStartedAt) / CLOSE_MS, 0, 1);
+    progress = lerp(phaseStartProgress, 1, t);
+    if (t >= 1) {
+      phase = 'closed-hold';
+      phaseStartedAt = now;
+      progress = 1;
+    }
+  } else if (phase === 'closed-hold') {
+    progress = 1;
+    if (now - phaseStartedAt >= CLOSED_HOLD_MS) {
+      phase = 'opening';
+      phaseStartedAt = now;
+      phaseStartProgress = 1;
+    }
+  } else if (phase === 'opening' || phase === 'waking') {
+    const duration = phase === 'waking' ? WAKE_OPEN_MS : OPEN_MS;
+    const t = clamp((now - phaseStartedAt) / duration, 0, 1);
+    progress = lerp(phaseStartProgress, 0, t);
+    if (t >= 1) {
+      progress = 0;
+      phase = 'open';
+      phaseStartedAt = now;
+      nextAutomaticBlink = now + randomBetween(2900, 4900);
+      statusText.textContent = 'READY';
+    }
+  } else if (phase === 'sleep-closing') {
+    const t = clamp((now - phaseStartedAt) / SLEEP_CLOSE_MS, 0, 1);
+    progress = lerp(phaseStartProgress, 1, t);
+    if (t >= 1) {
+      progress = 1;
+      phase = 'sleeping';
+      statusText.textContent = 'SLEEPING';
+    }
+  } else if (phase === 'sleeping') {
+    progress = 1;
+  }
+}
+
+blinkButton.addEventListener('click', () => beginBlink());
+sleepButton.addEventListener('click', toggleSleep);
+renderer.domElement.addEventListener('pointerdown', () => beginBlink());
+window.addEventListener('keydown', (event) => {
+  if (event.code === 'Space') {
+    event.preventDefault();
+    beginBlink();
+  } else if (event.key.toLowerCase() === 's') {
+    toggleSleep();
+  }
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && phase === 'open' && !sleeping) {
+    nextAutomaticBlink = performance.now() + randomBetween(1900, 3100);
+  }
+});
+
+function animate(now) {
+  updateAnimation(now);
+  leftEye.update(progress);
+  rightEye.update(progress);
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+

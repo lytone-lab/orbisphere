@@ -1,0 +1,1014 @@
+﻿import * as THREE from "three";
+
+/* =========================================================
+   GENERAL HELPERS
+========================================================= */
+
+function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+}
+
+function smoothstep(edge0, edge1, value) {
+    const t = clamp((value - edge0) / (edge1 - edge0), 0, 1);
+    return t * t * (3 - 2 * t);
+}
+
+/* =========================================================
+   EYELID GEOMETRY
+
+   Each lid is a filled circular segment.
+
+   Upper lid: circular top region.
+   Lower lid: circular bottom region.
+
+   Their inner edges use the SAME mathematical curve
+   when fully closed.
+========================================================= */
+
+export function createBlinkLidMesh({
+    side,
+    radius = 1.304,
+    faceColor = 0xf1cb2e,
+    z = 0.045,
+    segments = 64
+} = {}) {
+
+    if (side !== "upper" && side !== "lower") {
+        throw new Error("Lid side must be upper or lower.");
+    }
+
+    segments = Math.max(24, Math.floor(segments));
+
+    const boundaryCount = 2 * (segments + 1);
+    const centerIndex = boundaryCount;
+
+    const positions = new Float32Array(
+        (boundaryCount + 1) * 3
+    );
+
+    const indices = [];
+
+    // Triangle fan fills the eyelid region.
+    for (let i = 0; i < boundaryCount; i++) {
+        const next = (i + 1) % boundaryCount;
+
+        indices.push(centerIndex, i, next);
+    }
+
+    const geometry = new THREE.BufferGeometry();
+
+    const positionAttribute = new THREE.BufferAttribute(
+        positions,
+        3
+    );
+
+    positionAttribute.setUsage(THREE.DynamicDrawUsage);
+
+    geometry.setAttribute("position", positionAttribute);
+    geometry.setIndex(indices);
+
+    const material = new THREE.MeshBasicMaterial({
+        color: faceColor,
+        side: THREE.DoubleSide,
+        depthTest: true,
+        depthWrite: false,
+        toneMapped: false
+    });
+
+    const mesh = new THREE.Mesh(geometry, material);
+
+    mesh.position.z = z;
+    mesh.renderOrder = 10;
+    mesh.frustumCulled = false;
+
+    mesh.userData.orbiLid = {
+        side,
+        segments,
+        boundaryCount,
+        radius
+    };
+
+    return mesh;
+}
+
+
+/* =========================================================
+   UPDATE ONE EYELID'S VERTICES
+
+   The outer edge follows the circular eye boundary.
+
+   The inner edge is:
+   y = edgeY - sag * (1 - u*u)
+
+   Both lids use this exact same curve formula.
+========================================================= */
+
+function updateLidGeometry(
+    mesh,
+    side,
+    radius,
+    edgeY,
+    sag
+) {
+
+    const meta = mesh.userData.orbiLid;
+
+    if (!meta || meta.side !== side) {
+        throw new Error("Invalid Orbi eyelid geometry.");
+    }
+
+    const segments = meta.segments;
+    const boundaryCount = meta.boundaryCount;
+
+    const position = mesh.geometry.getAttribute("position");
+
+    const theta = Math.asin(
+        clamp(edgeY / radius, -1, 1)
+    );
+
+    const startAngle = Math.PI - theta;
+
+    // Upper lid travels over the top of the circle.
+    // Lower lid travels around the bottom.
+    const endAngle = side === "upper"
+        ? theta
+        : 2 * Math.PI + theta;
+
+    const halfWidth = Math.sqrt(
+        Math.max(0, radius * radius - edgeY * edgeY)
+    );
+
+    // -----------------------------------------------------
+    // 1. OUTER CIRCULAR BOUNDARY
+    // -----------------------------------------------------
+
+    for (let i = 0; i <= segments; i++) {
+
+        const t = i / segments;
+
+        const angle = THREE.MathUtils.lerp(
+            startAngle,
+            endAngle,
+            t
+        );
+
+        const x = radius * Math.cos(angle);
+        const y = radius * Math.sin(angle);
+
+        position.setXYZ(i, x, y, 0);
+    }
+
+    // -----------------------------------------------------
+    // 2. INNER CURVED BOUNDARY
+    // Runs from right to left.
+    // -----------------------------------------------------
+
+    const seamStart = segments + 1;
+
+    for (let i = 0; i <= segments; i++) {
+
+        const t = i / segments;
+
+        const u = 1 - 2 * t;
+
+        const x = halfWidth * u;
+
+        const y = edgeY - sag * (1 - u * u);
+
+        position.setXYZ(
+            seamStart + i,
+            x,
+            y,
+            0
+        );
+    }
+
+    // -----------------------------------------------------
+    // 3. TRIANGLE FAN CENTER
+    // -----------------------------------------------------
+
+    const seamCenterY = edgeY - sag;
+
+    const centerY = side === "upper"
+        ? (radius + seamCenterY) / 2
+        : (-radius + seamCenterY) / 2;
+
+    position.setXYZ(
+        boundaryCount,
+        0,
+        centerY,
+        0
+    );
+
+    position.needsUpdate = true;
+}
+
+
+/* =========================================================
+   CLOSED-EYE CREASE
+
+   A subtle dark line appears only near full closure.
+   This is a THREE.Line, NOT a torus.
+========================================================= */
+
+export function createClosedSeam({
+    radius = 1.304,
+    color = 0x071c34,
+    z = 0.065,
+    segments = 64
+} = {}) {
+
+    const positions = new Float32Array(
+        (segments + 1) * 3
+    );
+
+    const geometry = new THREE.BufferGeometry();
+
+    const attribute = new THREE.BufferAttribute(
+        positions,
+        3
+    );
+
+    attribute.setUsage(THREE.DynamicDrawUsage);
+
+    geometry.setAttribute("position", attribute);
+
+    const material = new THREE.LineBasicMaterial({
+        color,
+        transparent: true,
+        opacity: 0,
+        depthTest: true,
+        depthWrite: false,
+        toneMapped: false
+    });
+
+    const line = new THREE.Line(
+        geometry,
+        material
+    );
+
+    line.position.z = z;
+    line.renderOrder = 11;
+    line.frustumCulled = false;
+    line.visible = false;
+
+    return {
+        line,
+        radius,
+        segments
+    };
+}
+
+
+function updateClosedSeam(
+    seam,
+    meetingY,
+    sag,
+    close
+) {
+
+    const { line, radius, segments } = seam;
+
+    const position = line.geometry.getAttribute("position");
+
+    const halfWidth = Math.sqrt(
+        Math.max(0, radius * radius - meetingY * meetingY)
+    );
+
+    for (let i = 0; i <= segments; i++) {
+
+        const t = i / segments;
+
+        const u = -1 + 2 * t;
+
+        const x = halfWidth * u;
+
+        const y = meetingY - sag * (1 - u * u);
+
+        position.setXYZ(i, x, y, 0);
+    }
+
+    position.needsUpdate = true;
+
+    // Reveal the crease only near full closure.
+    const alpha = smoothstep(0.94, 0.995, close);
+
+    line.material.opacity = alpha;
+    line.visible = alpha > 0.001;
+}
+
+
+/* =========================================================
+   MAIN BLINK FUNCTION
+
+   blinkScale:
+       1 = open
+       0 = closed
+
+   eyeData contains the meshes for ONE eye.
+========================================================= */
+
+export function updateBlink(blinkScale, eyeData) {
+
+    if (
+        !eyeData ||
+        !eyeData.normalEye ||
+        !eyeData.pupilGroup ||
+        !eyeData.upperLid ||
+        !eyeData.lowerLid
+    ) {
+        throw new Error(
+            "Orbi blink: missing required eye components."
+        );
+    }
+
+    const raw = Number(blinkScale);
+
+    const openAmount = clamp(
+        Number.isFinite(raw) ? raw : 1,
+        0,
+        1
+    );
+
+    const close = 1 - openAmount;
+
+    // -----------------------------------------------------
+    // 1. EYE DIMENSIONS
+    // -----------------------------------------------------
+
+    const eyeRadius = eyeData.radius ?? 1.3;
+
+    const maskRadius =
+        eyeData.lidRadius ?? (eyeRadius + 0.004);
+
+    const upperShare = clamp(
+        eyeData.upperTravelShare ?? 0.80,
+        0.5,
+        0.9
+    );
+
+    // -----------------------------------------------------
+    // 2. EXACT MEETING POINT
+    // -----------------------------------------------------
+
+    const meetingY = eyeRadius * (1 - 2 * upperShare);
+
+    // Upper lid descends.
+    const upperY = THREE.MathUtils.lerp(
+        maskRadius,
+        meetingY,
+        close
+    );
+
+    // Lower lid rises.
+    const lowerY = THREE.MathUtils.lerp(
+        -maskRadius,
+        meetingY,
+        close
+    );
+
+    // -----------------------------------------------------
+    // 3. SHARED CURVE
+    // Curve appears progressively as the eye closes.
+    // -----------------------------------------------------
+
+    const maxSag =
+        eyeData.closedCurveSag ?? eyeRadius * 0.035;
+
+    const sag = maxSag * close * close;
+
+    // -----------------------------------------------------
+    // 4. MOVE THE TWO FILLED LIDS
+    // -----------------------------------------------------
+
+    updateLidGeometry(
+        eyeData.upperLid,
+        "upper",
+        maskRadius,
+        upperY,
+        sag
+    );
+
+    updateLidGeometry(
+        eyeData.lowerLid,
+        "lower",
+        maskRadius,
+        lowerY,
+        sag
+    );
+
+    eyeData.upperLid.visible = close > 0.0001;
+    eyeData.lowerLid.visible = close > 0.0001;
+
+    // -----------------------------------------------------
+    // 5. CACHE ORIGINAL TRANSFORMS ONCE
+    // -----------------------------------------------------
+
+    if (!eyeData._blinkBase) {
+
+        eyeData._blinkBase = {
+
+            blinkGroupScale: eyeData.blinkGroup
+                ? eyeData.blinkGroup.scale.clone()
+                : null,
+
+            eyeScale: eyeData.normalEye.scale.clone(),
+
+            pupilScale: eyeData.pupilGroup.scale.clone(),
+
+            pupilPosition: eyeData.pupilGroup.position.clone()
+
+        };
+    }
+
+    // -----------------------------------------------------
+    // 6. UNIFORM EYE SHRINKING
+    //
+    // Never compress only the Y axis.
+    // The pupil and sclera remain circular.
+    // -----------------------------------------------------
+
+    const minimumScale = clamp(
+        eyeData.minimumBlinkScale ?? 0.08,
+        0.01,
+        1
+    );
+
+    const shrink = THREE.MathUtils.lerp(
+        1,
+        minimumScale,
+        close
+    );
+
+    if (eyeData.blinkGroup) {
+
+        const base = eyeData._blinkBase.blinkGroupScale;
+
+        eyeData.blinkGroup.scale.set(
+            base.x * shrink,
+            base.y * shrink,
+            base.z * shrink
+        );
+
+    } else {
+
+        // Fallback if the objects are not in a common parent.
+        // The pupil position is also scaled towards the eye center.
+
+        eyeData.normalEye.scale
+            .copy(eyeData._blinkBase.eyeScale)
+            .multiplyScalar(shrink);
+
+        eyeData.pupilGroup.scale
+            .copy(eyeData._blinkBase.pupilScale)
+            .multiplyScalar(shrink);
+
+        eyeData.pupilGroup.position
+            .copy(eyeData._blinkBase.pupilPosition)
+            .multiplyScalar(shrink);
+    }
+
+    // -----------------------------------------------------
+    // 7. CLOSED-EYE CREASE
+    // -----------------------------------------------------
+
+    if (eyeData.closedSeam) {
+
+        updateClosedSeam(
+            eyeData.closedSeam,
+            meetingY,
+            sag,
+            close
+        );
+    }
+}
+
+
+/* =========================================================
+   EYEBROW GEOMETRY
+========================================================= */
+
+function createPillGeometry(width, height) {
+
+    const r = height / 2;
+
+    const shape = new THREE.Shape();
+
+    shape.moveTo(-width / 2 + r, -height / 2);
+
+    shape.lineTo(width / 2 - r, -height / 2);
+
+    shape.quadraticCurveTo(
+        width / 2,
+        -height / 2,
+        width / 2,
+        -height / 2 + r
+    );
+
+    shape.lineTo(width / 2, height / 2 - r);
+
+    shape.quadraticCurveTo(
+        width / 2,
+        height / 2,
+        width / 2 - r,
+        height / 2
+    );
+
+    shape.lineTo(-width / 2 + r, height / 2);
+
+    shape.quadraticCurveTo(
+        -width / 2,
+        height / 2,
+        -width / 2,
+        height / 2 - r
+    );
+
+    shape.lineTo(-width / 2, -height / 2 + r);
+
+    shape.quadraticCurveTo(
+        -width / 2,
+        -height / 2,
+        -width / 2 + r,
+        -height / 2
+    );
+
+    shape.closePath();
+
+    return new THREE.ShapeGeometry(shape, 12);
+}
+
+
+/* =========================================================
+   CREATE ONE COMPLETE EYE RIG
+
+   The eye and pupil are inside blinkGroup.
+   The lids are outside blinkGroup.
+   The eyebrow is independent of blinking.
+========================================================= */
+
+export function createEyeRig({
+
+    x = 0,
+    y = 0,
+    radius = 1.3,
+
+    faceColor = 0xf1cb2e,
+
+    eyeColor = 0x4b9bd8,
+
+    pupilColor = 0x071c34,
+
+    browColor = 0x071c34,
+
+    browTilt = 0,
+
+    browWidth = 3.0,
+
+    browHeight = 0.35,
+
+    browY = 1.25,
+
+    upperTravelShare = 0.80
+
+} = {}) {
+
+    const root = new THREE.Group();
+
+    root.position.set(x, y, 0);
+
+    // -----------------------------------------------------
+    // BLINK GROUP
+    // -----------------------------------------------------
+
+    const blinkGroup = new THREE.Group();
+
+    root.add(blinkGroup);
+
+    // -----------------------------------------------------
+    // BLUE SCLERA
+    // -----------------------------------------------------
+
+    const normalEye = new THREE.Mesh(
+
+        new THREE.CircleGeometry(radius, 96),
+
+        new THREE.MeshBasicMaterial({
+            color: eyeColor,
+            side: THREE.DoubleSide,
+            toneMapped: false
+        })
+
+    );
+
+    normalEye.position.z = 0;
+
+    blinkGroup.add(normalEye);
+
+    // -----------------------------------------------------
+    // DARK PUPIL
+    // -----------------------------------------------------
+
+    const pupilGroup = new THREE.Group();
+
+    pupilGroup.position.set(0.02, -0.02, 0.02);
+
+    const pupil = new THREE.Mesh(
+
+        new THREE.CircleGeometry(radius * 0.5, 80),
+
+        new THREE.MeshBasicMaterial({
+            color: pupilColor,
+            side: THREE.DoubleSide,
+            toneMapped: false
+        })
+
+    );
+
+    pupilGroup.add(pupil);
+
+    // Main highlight.
+    const highlight = new THREE.Mesh(
+
+        new THREE.CircleGeometry(0.13, 32),
+
+        new THREE.MeshBasicMaterial({
+            color: 0xf4fbff,
+            toneMapped: false
+        })
+
+    );
+
+    highlight.position.set(-0.18, 0.20, 0.01);
+
+    pupilGroup.add(highlight);
+
+    blinkGroup.add(pupilGroup);
+
+    // -----------------------------------------------------
+    // UPPER AND LOWER FILLED MASKS
+    // -----------------------------------------------------
+
+    const lidRadius = radius + 0.004;
+
+    const upperLid = createBlinkLidMesh({
+
+        side: "upper",
+
+        radius: lidRadius,
+
+        faceColor,
+
+        z: 0.045,
+
+        segments: 64
+
+    });
+
+    const lowerLid = createBlinkLidMesh({
+
+        side: "lower",
+
+        radius: lidRadius,
+
+        faceColor,
+
+        z: 0.045,
+
+        segments: 64
+
+    });
+
+    root.add(upperLid, lowerLid);
+
+    // -----------------------------------------------------
+    // CLOSED-EYE CREASE
+    // -----------------------------------------------------
+
+    const closedSeam = createClosedSeam({
+
+        radius: lidRadius,
+
+        color: pupilColor,
+
+        z: 0.065,
+
+        segments: 64
+
+    });
+
+    root.add(closedSeam.line);
+
+    // -----------------------------------------------------
+    // BROW
+    // -----------------------------------------------------
+
+    const browMaterial = new THREE.MeshBasicMaterial({
+
+        color: browColor,
+
+        side: THREE.DoubleSide,
+
+        toneMapped: false
+
+    });
+
+    const brow = new THREE.Mesh(
+        createPillGeometry(browWidth, browHeight),
+        browMaterial
+    );
+
+    // Shift each brow slightly towards the center.
+    const inwardOffset = x < 0 ? 0.06 : -0.06;
+
+    brow.position.set(
+        inwardOffset,
+        browY,
+        0.08
+    );
+
+    brow.rotation.z = browTilt;
+
+    brow.userData.restRotationZ = browTilt;
+
+    root.add(brow);
+
+    // -----------------------------------------------------
+    // RETURN THE COMPLETE EYE DATA
+    // -----------------------------------------------------
+
+    return {
+
+        root,
+
+        normalEye,
+
+        pupilGroup,
+
+        blinkGroup,
+
+        pupil,
+
+        highlight,
+
+        upperLid,
+
+        lowerLid,
+
+        closedSeam,
+
+        brow,
+
+        radius,
+
+        lidRadius,
+
+        upperTravelShare,
+
+        closedCurveSag: radius * 0.035,
+
+        minimumBlinkScale: 0.08
+
+    };
+}
+
+
+/* =========================================================
+   BLINK AND SLEEP CONTROLLER
+
+   Closing: 90 ms
+   Hold:     10 ms
+   Opening: 170 ms
+
+   Automatic blinking is enabled by default.
+========================================================= */
+
+export function createBlinkController(
+    eyes,
+    options = {}
+) {
+
+    const config = {
+
+        autoBlink: true,
+
+        closeMs: 90,
+
+        holdMs: 10,
+
+        openMs: 170,
+
+        sleepDamping: 12,
+
+        autoMinSeconds: 2.5,
+
+        autoMaxSeconds: 5.0,
+
+        ...options
+
+    };
+
+    let active = false;
+
+    let sleeping = false;
+
+    let elapsed = 0;
+
+    let sleepBlend = 0;
+
+    let currentOpen = 1;
+
+    function randomAutoDelay() {
+
+        return config.autoMinSeconds +
+            Math.random() *
+            (config.autoMaxSeconds - config.autoMinSeconds);
+
+    }
+
+    let autoTimer = randomAutoDelay();
+
+    function easeInCubic(t) {
+        return t * t * t;
+    }
+
+    function easeOutCubic(t) {
+        return 1 - Math.pow(1 - t, 3);
+    }
+
+    function triggerBlink() {
+
+        if (sleeping || active || sleepBlend > 0.05) {
+            return false;
+        }
+
+        active = true;
+
+        elapsed = 0;
+
+        autoTimer = randomAutoDelay();
+
+        return true;
+    }
+
+    function setSleeping(value) {
+
+        sleeping = Boolean(value);
+
+        if (sleeping) {
+
+            active = false;
+
+            elapsed = 0;
+
+        } else {
+
+            autoTimer = randomAutoDelay();
+
+        }
+
+    }
+
+    function update(deltaTime) {
+
+        const dt = clamp(
+            Number.isFinite(deltaTime) ? deltaTime : 0,
+            0,
+            0.05
+        );
+
+        // -----------------------------------------------
+        // AUTOMATIC BLINK SCHEDULER
+        // -----------------------------------------------
+
+        if (
+            config.autoBlink &&
+            !sleeping &&
+            !active &&
+            sleepBlend < 0.02
+        ) {
+
+            autoTimer -= dt;
+
+            if (autoTimer <= 0) {
+                triggerBlink();
+            }
+        }
+
+        // -----------------------------------------------
+        // MANUAL/AUTOMATIC BLINK PROGRESSION
+        // -----------------------------------------------
+
+        let blinkOpen = 1;
+
+        if (active && !sleeping) {
+
+            elapsed += dt * 1000;
+
+            const closeEnd = config.closeMs;
+
+            const holdEnd =
+                closeEnd + config.holdMs;
+
+            const totalDuration =
+                holdEnd + config.openMs;
+
+            if (elapsed <= closeEnd) {
+
+                const t = clamp(
+                    elapsed / closeEnd,
+                    0,
+                    1
+                );
+
+                blinkOpen = 1 - easeInCubic(t);
+
+            } else if (elapsed <= holdEnd) {
+
+                blinkOpen = 0;
+
+            } else {
+
+                const t = clamp(
+                    (elapsed - holdEnd) / config.openMs,
+                    0,
+                    1
+                );
+
+                blinkOpen = easeOutCubic(t);
+
+                if (elapsed >= totalDuration) {
+
+                    blinkOpen = 1;
+
+                    active = false;
+
+                    elapsed = 0;
+
+                }
+            }
+        }
+
+        // -----------------------------------------------
+        // SLEEP TRANSITION
+        // -----------------------------------------------
+
+        sleepBlend = THREE.MathUtils.damp(
+
+            sleepBlend,
+
+            sleeping ? 1 : 0,
+
+            config.sleepDamping,
+
+            dt
+
+        );
+
+        // Combine blink and sleeping states.
+        const openAmount = blinkOpen * (1 - sleepBlend);
+
+        currentOpen = openAmount;
+
+        // -----------------------------------------------
+        // APPLY TO BOTH EYES
+        // -----------------------------------------------
+
+        for (const eye of eyes) {
+
+            updateBlink(openAmount, eye);
+
+            if (eye.brow) {
+
+                const baseRotation =
+                    eye.brow.userData.restRotationZ ?? 0;
+
+                // Sleeping brow becomes perfectly horizontal.
+                eye.brow.rotation.z = THREE.MathUtils.lerp(
+                    baseRotation,
+                    0,
+                    sleepBlend
+                );
+            }
+        }
+
+        return openAmount;
+    }
+
+    return {
+
+        triggerBlink,
+
+        setSleeping,
+
+        update,
+
+        get isSleeping() {
+            return sleeping;
+        },
+
+        get openAmount() {
+            return currentOpen;
+        }
+
+    };
+}
